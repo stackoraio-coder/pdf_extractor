@@ -7,7 +7,9 @@ import os
 import tempfile
 import traceback
 import logging
-from typing import List
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
 
@@ -19,6 +21,10 @@ from extractor import (
     extract_fields, fill_excel_template, to_excel_date_display,
     extract_all_projections, extract_documents_ordered,
 )
+
+# ── Job store (in-memory) ─────────────────────────────────────────────────────
+_JOBS: Dict[str, Dict[str, Any]] = {}   # job_id → {status, records, error}
+_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 # ── Auth config ───────────────────────────────────────────────────────────────
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "llanoseguros2026*")
@@ -394,40 +400,59 @@ async function processFiles(){
   document.getElementById("empty_row").style.display = "none";
   setProcessing(true);
   showLoadingPlaceholder();
+  setPhase(1, 10, "Enviando archivos al servidor...");
 
-  // Phase 1
-  setPhase(1, 15, "Extrayendo proyecciones del PDF...");
   const form = new FormData();
   form.append("proyecciones", projFile);
   if(docsFile) form.append("documentos", docsFile);
 
-  // Phase 2 (visual — backend does both at once)
-  setTimeout(()=>{ setPhase(2, 50, "Leyendo documentos y extrayendo datos con OCR..."); }, 800);
-  setTimeout(()=>{ setPhase(3, 80, "Cruzando datos por posición..."); }, 1600);
-
+  let jobId;
   try {
-    const res = await fetch("/extract-batch",{method:"POST",body:form});
+    const res = await fetch("/extract-batch", {method:"POST", body:form});
     const data = await res.json();
-
-    if(data.error){
-      removeLoadingRow();
-      setProcessing(false);
-      showToast("❌ Error: "+data.error);
-      return;
-    }
-
-    const records = data.records || [];
-    records.forEach(r => rows.push(r));
-    removeLoadingRow();
-    renderRows();
-    setPhase(3, 100, "¡Listo!");
-    setTimeout(()=>setProcessing(false), 600);
-    showToast("✅ "+records.length+" cliente"+(records.length!==1?"s":"")+" extraído"+(records.length!==1?"s":""));
+    jobId = data.job_id;
+    if(!jobId) throw new Error(data.error || "No se recibió job_id");
   } catch(err) {
     removeLoadingRow();
     setProcessing(false);
-    showToast("❌ Error de conexión: "+err.message);
+    showToast("❌ Error al enviar: "+err.message);
+    return;
   }
+
+  // Poll for result
+  setPhase(1, 25, "Extrayendo proyecciones...");
+  let elapsed = 0;
+  const pollInterval = setInterval(async ()=>{
+    elapsed += 3;
+    // Advance progress visually
+    if(elapsed < 15)      setPhase(1, 30, "Leyendo proyecciones del PDF...");
+    else if(elapsed < 40) setPhase(2, 55, "OCR en páginas de documentos y cédulas...");
+    else                  setPhase(3, 80, "Cruzando datos y generando tabla...");
+
+    try {
+      const r = await fetch("/job/"+jobId);
+      const job = await r.json();
+
+      if(job.status === "done"){
+        clearInterval(pollInterval);
+        const records = job.records || [];
+        records.forEach(r => rows.push(r));
+        removeLoadingRow();
+        renderRows();
+        setPhase(3, 100, "¡Listo!");
+        setTimeout(()=>setProcessing(false), 600);
+        showToast("✅ "+records.length+" cliente"+(records.length!==1?"s":"")+" extraído"+(records.length!==1?"s":""));
+      } else if(job.status === "error"){
+        clearInterval(pollInterval);
+        removeLoadingRow();
+        setProcessing(false);
+        showToast("❌ Error: "+(job.error||"desconocido"));
+      }
+      // else still "processing" — keep polling
+    } catch(err) {
+      // Network hiccup — keep trying
+    }
+  }, 3000);
 }
 
 function tsv(){
@@ -466,47 +491,34 @@ document.getElementById("btn_clear").addEventListener("click", clearRows);
 def home():
     return HTML
 
-@app.post("/extract-batch")
-async def extract_batch(
-    proyecciones: UploadFile = File(...),
-    documentos: UploadFile = File(None),
-):
-    """
-    Main batch endpoint. Receives:
-      - proyecciones: PDF with one or more credit projections
-      - documentos:   (optional) PDF with scanned ID+health declaration pages
-    Returns merged records list, one entry per client found in proyecciones.
-    """
+def _run_extraction(job_id: str, proj_bytes: bytes, proj_name: str,
+                    docs_bytes: bytes | None, docs_name: str | None):
+    """Background worker: runs OCR and stores results in _JOBS."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
 
-            # 1. Extract all projections
-            proj_path = tmp / proyecciones.filename
-            proj_path.write_bytes(await proyecciones.read())
+            proj_path = tmp / (proj_name or "proyecciones.pdf")
+            proj_path.write_bytes(proj_bytes)
             records = extract_all_projections(proj_path)
 
-            # 2. Extract documents (ordered list, best-effort)
             doc_records = []
-            if documentos and documentos.filename:
-                docs_path = tmp / documentos.filename
-                docs_path.write_bytes(await documentos.read())
+            if docs_bytes and docs_name:
+                docs_path = tmp / docs_name
+                docs_path.write_bytes(docs_bytes)
                 try:
                     doc_records = extract_documents_ordered(docs_path)
                 except Exception as doc_err:
                     logging.warning("Documentos OCR parcial: %s", doc_err)
 
-            # 3. Merge by position
             for i, rec in enumerate(records):
                 if i < len(doc_records):
                     doc = doc_records[i]
-                    # Only fill if proyecciones didn't already have these
                     if not rec.get("fecha_nacimiento") and doc.get("fecha_nacimiento"):
                         rec["fecha_nacimiento"] = doc["fecha_nacimiento"]
                         rec["fecha_nacimiento_excel"] = doc["fecha_nacimiento_excel"]
                     if not rec.get("extraprima") and doc.get("extraprima"):
                         rec["extraprima"] = doc["extraprima"]
-                    # Refresh notes
                     notes = []
                     if not rec.get("fecha_nacimiento"):
                         notes.append("Fecha nacimiento: revisar manualmente.")
@@ -514,11 +526,41 @@ async def extract_batch(
                         notes.append("Valor crédito no detectado.")
                     rec["raw_confidence_notes"] = " ".join(notes) or "OK"
 
-        return JSONResponse({"records": records})
+        _JOBS[job_id] = {"status": "done", "records": records}
+        logging.info("Job %s completado: %d registros", job_id, len(records))
     except Exception as e:
         tb = traceback.format_exc()
-        logging.error("Error en extract-batch:\n%s", tb)
-        return JSONResponse({"error": str(e), "traceback": tb}, status_code=500)
+        logging.error("Job %s falló:\n%s", job_id, tb)
+        _JOBS[job_id] = {"status": "error", "error": str(e)}
+
+
+@app.post("/extract-batch")
+async def extract_batch(
+    proyecciones: UploadFile = File(...),
+    documentos: UploadFile = File(None),
+):
+    """
+    Inicia el procesamiento en background y devuelve un job_id inmediatamente.
+    El cliente hace polling a GET /job/{job_id} para obtener el resultado.
+    """
+    proj_bytes = await proyecciones.read()
+    docs_bytes = await documentos.read() if documentos and documentos.filename else None
+    docs_name  = documentos.filename if documentos and documentos.filename else None
+
+    job_id = str(uuid.uuid4())
+    _JOBS[job_id] = {"status": "processing"}
+    _EXECUTOR.submit(_run_extraction, job_id, proj_bytes, proyecciones.filename,
+                     docs_bytes, docs_name)
+
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/job/{job_id}")
+async def get_job(job_id: str):
+    job = _JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+    return JSONResponse(job)
 
 @app.post("/extract-json")
 async def extract_json(pdf: UploadFile = File(...)):
