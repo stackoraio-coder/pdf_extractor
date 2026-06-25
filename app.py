@@ -15,7 +15,10 @@ from fastapi import FastAPI, UploadFile, File, Form, Request, Response
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from extractor import extract_fields, fill_excel_template, to_excel_date_display
+from extractor import (
+    extract_fields, fill_excel_template, to_excel_date_display,
+    extract_all_projections, extract_documents_ordered,
+)
 
 # ── Auth config ───────────────────────────────────────────────────────────────
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "llanoseguros2026*")
@@ -118,10 +121,14 @@ HTML = """
     h1 { margin:0; font-size:28px; letter-spacing:-.03em; }
     .muted { color:#64748b; margin:6px 0 0; font-size:14px; }
     .card { background:#fff; border:1px solid var(--border); border-radius:16px; padding:20px; box-shadow:0 4px 24px rgba(15,23,42,.06); }
-    label { display:block; font-weight:700; margin-bottom:8px; font-size:14px; }
+    label { display:block; font-weight:700; margin-bottom:6px; font-size:14px; }
+    .label-badge { font-size:11px; font-weight:600; padding:2px 7px; border-radius:999px; margin-left:6px; vertical-align:middle; }
+    .badge-req { background:#fee2e2; color:#991b1b; }
+    .badge-opt { background:#e0f2fe; color:#0369a1; }
     input, button { font:inherit; }
-    input[type=file] { width:100%; padding:10px 12px; border:2px dashed var(--border); border-radius:12px; background:#fafbff; cursor:pointer; font-size:14px; }
-    input[type=file]:hover { border-color:var(--blue); }
+    input[type=file] { width:100%; padding:10px 12px; border:2px dashed var(--border); border-radius:12px; background:#fafbff; cursor:pointer; font-size:14px; transition:.2s; }
+    input[type=file]:hover { border-color:var(--blue); background:#f0f7ff; }
+    input[type=file].has-file { border-color:#22c55e; background:#f0fdf4; }
     button { border:0; border-radius:10px; padding:10px 18px; font-weight:700; cursor:pointer; font-size:14px; transition: opacity .15s, transform .1s; }
     button:active { transform:scale(.97); }
     button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
@@ -132,17 +139,21 @@ HTML = """
     .danger { background:#fee2e2; color:#991b1b; }
     .danger:hover:not(:disabled) { background:#fecaca; }
     .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
-    .help { font-size:13px; color:#64748b; margin-top:8px; }
+    .help { font-size:12px; color:#64748b; margin-top:6px; }
+    .pickers { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
 
     /* Progress banner */
     .progress-banner { display:none; margin-top:16px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:12px; padding:14px 16px; }
     .progress-banner.active { display:block; }
-    .progress-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
-    .progress-label { font-size:13px; font-weight:700; color:#1d4ed8; }
-    .progress-count { font-size:13px; color:#3b82f6; font-weight:600; }
-    .progress-file { font-size:12px; color:#64748b; margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .phases { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+    .phase { display:flex; align-items:center; gap:5px; font-size:12px; font-weight:600; padding:4px 10px; border-radius:999px; background:#dbeafe; color:#1e40af; opacity:.4; transition:.3s; }
+    .phase.active { opacity:1; background:#2563eb; color:#fff; }
+    .phase.done { opacity:.7; background:#dcfce7; color:#166534; }
     .bar-track { height:8px; background:#dbeafe; border-radius:999px; overflow:hidden; }
-    .bar-fill { height:100%; width:0%; background:var(--blue); border-radius:999px; transition:.3s ease; }
+    .bar-fill { height:100%; width:0%; background:var(--blue); border-radius:999px; transition:.4s ease; }
+    .prog-detail { font-size:12px; color:#64748b; margin-top:6px; }
+    .spinner { display:inline-block; width:13px; height:13px; border:2px solid currentColor; border-top-color:transparent; border-radius:50%; animation:spin .7s linear infinite; vertical-align:middle; }
+    @keyframes spin { to{transform:rotate(360deg)} }
 
     /* KPIs */
     .kpis { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }
@@ -154,8 +165,6 @@ HTML = """
 
     /* Table */
     .table-wrap { margin-top:20px; overflow:auto; border:1px solid var(--border); border-radius:16px; background:#fff; }
-    .table-header { display:flex; justify-content:space-between; align-items:center; padding:14px 16px 0; }
-    .table-title { font-weight:700; font-size:15px; }
     table { width:100%; border-collapse:collapse; min-width:1050px; }
     thead th { position:sticky; top:0; background:#0f172a; color:#fff; text-align:left; font-size:12px; letter-spacing:.04em; text-transform:uppercase; padding:11px 12px; }
     tbody td { padding:10px 12px; border-bottom:1px solid #f1f5f9; white-space:nowrap; font-size:13px; }
@@ -163,28 +172,19 @@ HTML = """
     td[contenteditable="true"]:focus { background:#fff8e1; box-shadow:inset 0 0 0 2px #fbbf24; border-radius:4px; }
     tbody tr:hover td { background:#f8fafc; }
     tbody tr:last-child td { border-bottom:none; }
-
-    /* Loading row */
     .loading-row td { background:#f0f7ff !important; }
-    .skeleton { display:inline-block; height:12px; border-radius:6px; background: linear-gradient(90deg,#e2e8f0 25%,#f1f5f9 50%,#e2e8f0 75%); background-size:200% 100%; animation:shimmer 1.4s infinite; }
+    .skeleton { display:inline-block; height:12px; border-radius:6px; background:linear-gradient(90deg,#e2e8f0 25%,#f1f5f9 50%,#e2e8f0 75%); background-size:200% 100%; animation:shimmer 1.4s infinite; }
     @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
-    .spinner { display:inline-block; width:14px; height:14px; border:2px solid #bfdbfe; border-top-color:var(--blue); border-radius:50%; animation:spin .7s linear infinite; vertical-align:middle; margin-right:6px; }
-    @keyframes spin { to{transform:rotate(360deg)} }
-
     .pill { display:inline-block; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:700; }
     .ok   { background:#dcfce7; color:#166534; }
     .warn { background:#fef3c7; color:#92400e; }
     .err  { background:#fee2e2; color:#991b1b; }
-
     .empty-state { text-align:center; padding:48px 0; color:#94a3b8; font-size:14px; }
     .empty-icon { font-size:36px; margin-bottom:8px; }
-
-    /* Done toast */
     .toast { display:none; position:fixed; bottom:24px; right:24px; background:#0f172a; color:#fff; padding:12px 20px; border-radius:12px; font-size:14px; font-weight:600; box-shadow:0 8px 32px rgba(0,0,0,.25); z-index:99; }
     .toast.show { display:block; animation:slideUp .3s ease; }
     @keyframes slideUp { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
-
-    @media (max-width:800px) { .kpis{grid-template-columns:1fr 1fr;} }
+    @media (max-width:800px) { .pickers,.kpis{grid-template-columns:1fr;} }
   </style>
 </head>
 <body>
@@ -193,15 +193,24 @@ HTML = """
   <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px">
     <div>
       <h1>Extractor PDF → Excel</h1>
-      <p class="muted">Sube uno o varios PDFs escaneados. Cada uno genera una fila editable lista para copiar en Excel.</p>
+      <p class="muted">Sube el PDF de proyecciones y el de documentos. La app extrae todos los clientes automáticamente.</p>
     </div>
     <a href="/logout" style="font-size:13px;color:#64748b;text-decoration:none;padding:8px 14px;border:1px solid #d9e2ef;border-radius:8px;background:#fff;white-space:nowrap;margin-top:4px">Cerrar sesión</a>
   </div>
 
   <div class="card">
-    <label>Seleccionar PDFs</label>
-    <input id="pdfs" type="file" accept="application/pdf" multiple />
-    <div class="help">Puedes subir 100+ PDFs a la vez. Las fechas se muestran en formato <b>MM-DD-YY</b>.</div>
+    <div class="pickers">
+      <div>
+        <label>Proyecciones <span class="label-badge badge-req">Requerido</span></label>
+        <input id="pdf_proj" type="file" accept="application/pdf" />
+        <div class="help">PDF con todas las proyecciones de crédito — puede contener varios clientes.</div>
+      </div>
+      <div>
+        <label>Documentos <span class="label-badge badge-opt">Opcional</span></label>
+        <input id="pdf_docs" type="file" accept="application/pdf" />
+        <div class="help">PDF con cédulas y declaraciones de salud — se usa para extraer fecha de nacimiento y extraprima.</div>
+      </div>
+    </div>
 
     <div class="actions">
       <button class="primary" id="btn_extract">⚡ Procesar PDFs</button>
@@ -211,38 +220,27 @@ HTML = """
     </div>
 
     <div class="progress-banner" id="progress_banner">
-      <div class="progress-top">
-        <span class="progress-label"><span class="spinner"></span>Procesando archivos...</span>
-        <span class="progress-count" id="prog_count">0 / 0</span>
+      <div class="phases">
+        <div class="phase" id="ph1"><span class="spinner"></span> Leyendo proyecciones</div>
+        <div class="phase" id="ph2"><span class="spinner"></span> Leyendo documentos</div>
+        <div class="phase" id="ph3"><span class="spinner"></span> Cruzando datos</div>
       </div>
       <div class="bar-track"><div class="bar-fill" id="bar"></div></div>
-      <div class="progress-file" id="prog_file"></div>
+      <div class="prog-detail" id="prog_detail"></div>
     </div>
 
     <div class="kpis">
-      <div class="kpi">
-        <div class="kpi-label">Total procesados</div>
-        <div class="kpi-value" id="kpi_total">0</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label">Completos</div>
-        <div class="kpi-value green" id="kpi_ok">0</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label">Por revisar</div>
-        <div class="kpi-value amber" id="kpi_warn">0</div>
-      </div>
+      <div class="kpi"><div class="kpi-label">Clientes encontrados</div><div class="kpi-value" id="kpi_total">0</div></div>
+      <div class="kpi"><div class="kpi-label">Completos</div><div class="kpi-value green" id="kpi_ok">0</div></div>
+      <div class="kpi"><div class="kpi-label">Por revisar</div><div class="kpi-value amber" id="kpi_warn">0</div></div>
     </div>
   </div>
 
   <div class="table-wrap">
-    <div class="table-header">
-      <span class="table-title">Resultados</span>
-    </div>
     <table id="records">
       <thead>
         <tr>
-          <th>Archivo</th>
+          <th>#</th>
           <th>Nombre</th>
           <th>Cédula</th>
           <th>Ingreso</th>
@@ -258,21 +256,27 @@ HTML = """
         <tr id="empty_row">
           <td colspan="10">
             <div class="empty-state">
-              <div class="empty-icon">📄</div>
-              Selecciona PDFs y haz clic en <b>Procesar PDFs</b> para comenzar.
+              <div class="empty-icon">📂</div>
+              Selecciona los PDFs y haz clic en <b>Procesar PDFs</b> para comenzar.
             </div>
           </td>
         </tr>
       </tbody>
     </table>
   </div>
-
 </div>
 <div class="toast" id="toast"></div>
 
 <script>
 const rows = [];
 const colsToCopy = ["nombre","cedula","ingreso_excel","valor_credito","seguro_vida_mensual","extraprima","fecha_nacimiento_excel"];
+
+// Mark file inputs green when a file is selected
+["pdf_proj","pdf_docs"].forEach(id=>{
+  document.getElementById(id).addEventListener("change", e=>{
+    e.target.classList.toggle("has-file", e.target.files.length > 0);
+  });
+});
 
 function money(v){ return v == null ? "" : Number(v).toLocaleString("en-US",{maximumFractionDigits:0}); }
 
@@ -291,7 +295,6 @@ function statusFor(r){
 
 function renderRows(){
   const tbody = document.querySelector("#records tbody");
-  // remove data rows but keep empty_row and loading_row
   [...tbody.querySelectorAll("tr.data-row")].forEach(r=>r.remove());
   let ok=0, warn=0;
   rows.forEach((r,idx)=>{
@@ -300,7 +303,7 @@ function renderRows(){
     const tr = document.createElement("tr");
     tr.className = "data-row";
     tr.innerHTML = `
-      <td title="${r.file_name||""}">${(r.file_name||"").length>22?(r.file_name||"").slice(0,20)+"…":r.file_name||""}</td>
+      <td style="color:#94a3b8;font-size:12px">${idx+1}</td>
       <td contenteditable="true" data-i="${idx}" data-k="nombre">${r.nombre||""}</td>
       <td contenteditable="true" data-i="${idx}" data-k="cedula">${r.cedula||""}</td>
       <td contenteditable="true" data-i="${idx}" data-k="ingreso_excel">${r.ingreso_excel||""}</td>
@@ -309,8 +312,7 @@ function renderRows(){
       <td contenteditable="true" data-i="${idx}" data-k="extraprima">${r.extraprima||""}</td>
       <td contenteditable="true" data-i="${idx}" data-k="fecha_nacimiento_excel">${r.fecha_nacimiento_excel||""}</td>
       <td><span class="pill ${st.cls}">${st.label}</span></td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${st.notes}">${st.notes}</td>`;
-    // insert before loading row (if present)
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:#64748b" title="${st.notes}">${st.notes}</td>`;
     const loader = document.getElementById("loading_row");
     if(loader) tbody.insertBefore(tr, loader);
     else tbody.appendChild(tr);
@@ -319,52 +321,60 @@ function renderRows(){
   document.getElementById("kpi_total").textContent = rows.length;
   document.getElementById("kpi_ok").textContent = ok;
   document.getElementById("kpi_warn").textContent = warn;
-  const hasRows = rows.length > 0;
-  document.getElementById("btn_copy").disabled = !hasRows;
-  document.getElementById("btn_csv").disabled  = !hasRows;
-  document.getElementById("btn_clear").disabled = !hasRows;
+  const has = rows.length > 0;
+  document.getElementById("btn_copy").disabled = !has;
+  document.getElementById("btn_csv").disabled  = !has;
+  document.getElementById("btn_clear").disabled = !has;
 }
 
-function addLoadingRow(filename){
+function showLoadingPlaceholder(){
   removeLoadingRow();
   const tbody = document.querySelector("#records tbody");
   const tr = document.createElement("tr");
   tr.id = "loading_row";
   tr.className = "loading-row";
   tr.innerHTML = `
-    <td><span class="spinner"></span>${filename.length>18?filename.slice(0,16)+"…":filename}</td>
-    <td><span class="skeleton" style="width:120px"></span></td>
-    <td><span class="skeleton" style="width:80px"></span></td>
+    <td><span class="skeleton" style="width:20px"></span></td>
+    <td><span class="skeleton" style="width:160px"></span></td>
+    <td><span class="skeleton" style="width:90px"></span></td>
     <td><span class="skeleton" style="width:70px"></span></td>
     <td><span class="skeleton" style="width:90px"></span></td>
-    <td><span class="skeleton" style="width:60px"></span></td>
+    <td><span class="skeleton" style="width:70px"></span></td>
     <td><span class="skeleton" style="width:50px"></span></td>
     <td><span class="skeleton" style="width:70px"></span></td>
     <td><span class="skeleton" style="width:50px"></span></td>
     <td></td>`;
   tbody.appendChild(tr);
-  tr.scrollIntoView({behavior:"smooth", block:"nearest"});
 }
 
-function removeLoadingRow(){
-  const el = document.getElementById("loading_row");
-  if(el) el.remove();
+function removeLoadingRow(){ const el=document.getElementById("loading_row"); if(el) el.remove(); }
+
+function setPhase(n, pct, detail){
+  [1,2,3].forEach(i=>{
+    const el = document.getElementById("ph"+i);
+    el.classList.remove("active","done");
+    if(i < n) el.classList.add("done");
+    else if(i === n) el.classList.add("active");
+  });
+  document.getElementById("bar").style.width = pct+"%";
+  document.getElementById("prog_detail").textContent = detail;
 }
 
-function showToast(msg, duration=3000){
+function showToast(msg, duration=3500){
   const t = document.getElementById("toast");
   t.textContent = msg;
   t.classList.add("show");
   setTimeout(()=>t.classList.remove("show"), duration);
 }
 
-function setProcessing(active, total=0, done=0){
-  const banner = document.getElementById("progress_banner");
-  banner.classList.toggle("active", active);
+function setProcessing(active){
+  document.getElementById("progress_banner").classList.toggle("active", active);
   document.getElementById("btn_extract").disabled = active;
   document.getElementById("btn_clear").disabled  = active;
-  if(active){
-    document.getElementById("prog_count").textContent = done+" / "+total;
+  if(!active){
+    [1,2,3].forEach(i=>{ const el=document.getElementById("ph"+i); el.classList.remove("active","done"); });
+    document.getElementById("bar").style.width="0%";
+    document.getElementById("prog_detail").textContent="";
   }
 }
 
@@ -375,40 +385,59 @@ document.addEventListener("input", e=>{
 });
 
 async function processFiles(){
-  const files = [...document.getElementById("pdfs").files];
-  if(!files.length){ alert("Selecciona al menos un PDF"); return; }
-  setProcessing(true, files.length, 0);
+  const projFile = document.getElementById("pdf_proj").files[0];
+  const docsFile = document.getElementById("pdf_docs").files[0];
+  if(!projFile){ alert("Selecciona al menos el PDF de Proyecciones"); return; }
+
+  rows.length = 0;
+  renderRows();
   document.getElementById("empty_row").style.display = "none";
-  for(let i=0;i<files.length;i++){
-    document.getElementById("prog_count").textContent = (i+1)+" / "+files.length;
-    document.getElementById("prog_file").textContent = "Procesando: "+files[i].name;
-    document.getElementById("bar").style.width = Math.round((i/files.length)*100)+"%";
-    addLoadingRow(files[i].name);
-    const form = new FormData();
-    form.append("pdf", files[i]);
-    const res = await fetch("/extract-json",{method:"POST",body:form});
+  setProcessing(true);
+  showLoadingPlaceholder();
+
+  // Phase 1
+  setPhase(1, 15, "Extrayendo proyecciones del PDF...");
+  const form = new FormData();
+  form.append("proyecciones", projFile);
+  if(docsFile) form.append("documentos", docsFile);
+
+  // Phase 2 (visual — backend does both at once)
+  setTimeout(()=>{ setPhase(2, 50, "Leyendo documentos y extrayendo datos con OCR..."); }, 800);
+  setTimeout(()=>{ setPhase(3, 80, "Cruzando datos por posición..."); }, 1600);
+
+  try {
+    const res = await fetch("/extract-batch",{method:"POST",body:form});
     const data = await res.json();
-    if(data.error){ data.nombre=""; data.raw_confidence_notes=data.error; }
-    data.file_name = files[i].name;
-    rows.push(data);
-    document.getElementById("bar").style.width = Math.round(((i+1)/files.length)*100)+"%";
+
+    if(data.error){
+      removeLoadingRow();
+      setProcessing(false);
+      showToast("❌ Error: "+data.error);
+      return;
+    }
+
+    const records = data.records || [];
+    records.forEach(r => rows.push(r));
+    removeLoadingRow();
     renderRows();
+    setPhase(3, 100, "¡Listo!");
+    setTimeout(()=>setProcessing(false), 600);
+    showToast("✅ "+records.length+" cliente"+(records.length!==1?"s":"")+" extraído"+(records.length!==1?"s":""));
+  } catch(err) {
+    removeLoadingRow();
+    setProcessing(false);
+    showToast("❌ Error de conexión: "+err.message);
   }
-  removeLoadingRow();
-  setProcessing(false);
-  showToast("✅ "+files.length+" PDF"+(files.length>1?"s":"")+" procesado"+(files.length>1?"s":""));
 }
 
 function tsv(){
   return rows.map(r=>colsToCopy.map(k=>(r[k]??"").toString().replace(/\\t|\\n/g," ")).join("\\t")).join("\\n");
 }
-
 async function copyTSV(){
   if(!rows.length) return;
   await navigator.clipboard.writeText(tsv());
-  showToast("📋 Filas copiadas — pega directamente en Excel");
+  showToast("📋 "+rows.length+" filas copiadas — pega en Excel");
 }
-
 function downloadCSV(){
   if(!rows.length) return;
   const header=["NOMBRE","CEDULA","INGRESO","VALOR CREDITO","SEG. MENSUAL","EXTRAPRIMA","FECHA NACIMIENTO"];
@@ -416,12 +445,10 @@ function downloadCSV(){
   const blob=new Blob([[header.join(","),...body].join("\\n")],{type:"text/csv;charset=utf-8"});
   const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="registros_extraidos.csv"; a.click();
 }
-
 function clearRows(){
   if(!rows.length) return;
-  if(!confirm("¿Seguro que quieres limpiar todos los registros?")) return;
-  rows.length=0;
-  renderRows();
+  if(!confirm("¿Limpiar todos los registros?")) return;
+  rows.length=0; renderRows();
   document.getElementById("bar").style.width="0%";
   document.getElementById("empty_row").style.display="";
 }
@@ -439,10 +466,59 @@ document.getElementById("btn_clear").addEventListener("click", clearRows);
 def home():
     return HTML
 
-@app.get("/preview", response_class=HTMLResponse)
-def preview():
-    sample = HTML.replace("const rows = [];", "const rows = [{file_name:'ejemplo.pdf',nombre:'LONDOÑO LOZADA JOHN EDWARD',cedula:'9.728.672',ingreso_excel:'06-05-26',valor_credito:5034402,seguro_vida_mensual:2937,extraprima:'',fecha_nacimiento_excel:'08-20-81',raw_confidence_notes:'OK'}]; setTimeout(render, 0);")
-    return sample
+@app.post("/extract-batch")
+async def extract_batch(
+    proyecciones: UploadFile = File(...),
+    documentos: UploadFile = File(None),
+):
+    """
+    Main batch endpoint. Receives:
+      - proyecciones: PDF with one or more credit projections
+      - documentos:   (optional) PDF with scanned ID+health declaration pages
+    Returns merged records list, one entry per client found in proyecciones.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+
+            # 1. Extract all projections
+            proj_path = tmp / proyecciones.filename
+            proj_path.write_bytes(await proyecciones.read())
+            records = extract_all_projections(proj_path)
+
+            # 2. Extract documents (ordered list, best-effort)
+            doc_records = []
+            if documentos and documentos.filename:
+                docs_path = tmp / documentos.filename
+                docs_path.write_bytes(await documentos.read())
+                try:
+                    doc_records = extract_documents_ordered(docs_path)
+                except Exception as doc_err:
+                    logging.warning("Documentos OCR parcial: %s", doc_err)
+
+            # 3. Merge by position
+            for i, rec in enumerate(records):
+                if i < len(doc_records):
+                    doc = doc_records[i]
+                    # Only fill if proyecciones didn't already have these
+                    if not rec.get("fecha_nacimiento") and doc.get("fecha_nacimiento"):
+                        rec["fecha_nacimiento"] = doc["fecha_nacimiento"]
+                        rec["fecha_nacimiento_excel"] = doc["fecha_nacimiento_excel"]
+                    if not rec.get("extraprima") and doc.get("extraprima"):
+                        rec["extraprima"] = doc["extraprima"]
+                    # Refresh notes
+                    notes = []
+                    if not rec.get("fecha_nacimiento"):
+                        notes.append("Fecha nacimiento: revisar manualmente.")
+                    if not rec.get("valor_credito"):
+                        notes.append("Valor crédito no detectado.")
+                    rec["raw_confidence_notes"] = " ".join(notes) or "OK"
+
+        return JSONResponse({"records": records})
+    except Exception as e:
+        tb = traceback.format_exc()
+        logging.error("Error en extract-batch:\n%s", tb)
+        return JSONResponse({"error": str(e), "traceback": tb}, status_code=500)
 
 @app.post("/extract-json")
 async def extract_json(pdf: UploadFile = File(...)):
