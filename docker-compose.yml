@@ -1,20 +1,19 @@
 services:
-  app:
+  pdf-extractor:
     build: .
+    container_name: pdf-extractor
     restart: unless-stopped
+
     expose:
       - "8000"
-    volumes:
-      - /tmp/pdf_extractor:/tmp
 
-  nginx:
-    image: nginx:alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
+    networks:
+      - stackora-network
+
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro   # para SSL con certbot
-    depends_on:
-      - app
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+
+networks:
+  stackora-network:
+    external: true
