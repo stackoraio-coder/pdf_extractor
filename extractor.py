@@ -260,55 +260,79 @@ def extract_all_projections(pdf_path: str | Path) -> List[Dict[str, Any]]:
     return results
 
 
+def _fix_ocr_digits(s: str) -> str:
+    """Replace common OCR letter-for-digit substitutions in a numeric string."""
+    return (s.replace("B", "8").replace("b", "8")
+             .replace("O", "0").replace("o", "0")
+             .replace("I", "1").replace("l", "1")
+             .replace("S", "5").replace("Z", "2")
+             .replace("G", "6").replace("q", "9"))
+
+
 def _extract_fn_from_cedula_text(text: str, upper: str) -> Optional[str]:
     """
     Extract fecha de nacimiento from a cedula photo page OCR result.
-    Cedulas have typeset 'FECHA DE NACIMIENTO: DD-MMM-YYYY'.
-    Handles OCR artifacts: separators replaced by letters/spaces, partial years.
+    Handles OCR artifacts:
+    - Separators: -, /, ., space, S, or missing
+    - Digits misread as letters: B→8, O→0, I→1, S→5
+    - Date on same line without separator before year: "17-ABR1985"
+    - Month abbreviation correct (ABR, FEB, etc.) or slightly off
     """
-    # Search near NACIMIENTO keyword (but NOT "LUGAR DE NACIMIENTO")
+    def _try_parse_named_month(day_s: str, mon_s: str, year_s: str) -> Optional[str]:
+        d = _fix_ocr_digits(day_s)
+        y = _fix_ocr_digits(year_s)
+        try:
+            d_int = int(d)
+            y_int = int(y) if len(y) == 4 else (int(y) + 1900 if int(y) > 30 else int(y) + 2000)
+        except ValueError:
+            return None
+        if not (1 <= d_int <= 31 and 1940 <= y_int <= 2015):
+            return None
+        mon_clean = mon_s.upper()[:3]
+        mo = MONTHS.get(mon_clean)
+        if not mo:
+            return None
+        try:
+            return datetime(y_int, mo, d_int).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    # Search near NACIMIENTO keyword (skip "LUGAR DE NACIMIENTO")
     for keyword in ("NACIMIENTO", "NACIM"):
-        pos = -1
         search_from = 0
         while True:
             idx = upper.find(keyword, search_from)
             if idx < 0:
                 break
-            # Skip "LUGAR DE NACIMIENTO" — that's a city, not a date
             context_before = upper[max(0, idx - 10):idx]
             if "LUGAR" not in context_before:
-                pos = idx
+                window = text[max(0, idx - 60): idx + 250]
+
+                # Named-month pattern: DD[-/. ]MMM[-/. ]YYYY
+                # Year group allows letters so _fix_ocr_digits can fix e.g. 19B5→1985
+                # NOTE: no numeric fallback here — cedulas always use named months
+                # (e.g. 17-ABR-1985) and numeric fallback risks picking up the
+                # FECHA DE EXPEDICION which is printed nearby.
+                mf = re.search(
+                    r"(\d{1,2})\s*[-/. S]?\s*([A-Za-z]{3,})\s*[-/. ]?\s*([0-9A-Za-z]{2,4})\b",
+                    window, re.I,
+                )
+                if mf:
+                    parsed = _try_parse_named_month(mf.group(1), mf.group(2), mf.group(3))
+                    if parsed:
+                        return parsed
                 break
             search_from = idx + 1
 
-        if pos >= 0:
-            window = text[max(0, pos - 60): pos + 250]
-            # Named-month with OCR artifacts: "O6SJUN-1988", "06-JUN-1981", "06 JUN 1988"
-            # Separators may be: - / S space or missing; digits may be O→0
-            mf = re.search(
-                r"(\d{1,2})\s*[-/S ]?\s*([A-Z]{3,})\s*[-/]?\s*((19|20)\d{2})\b",
-                window, re.I,
-            )
-            if mf:
-                raw = f"{mf.group(1)}-{mf.group(2)}-{mf.group(3)}"
-                parsed = _parse_date(raw)
-                if parsed:
-                    return parsed
-            # Numeric format: 06/06/1988 or 06-06-1988
-            mf = re.search(r"(\d{2}[-/]\d{2}[-/]\d{4})", window)
-            if mf:
-                parsed = _parse_date(mf.group(1))
-                if parsed:
-                    return parsed
-
-    # Fallback: any named-month date with full 4-digit year anywhere on page
-    mf = re.search(
-        r"\b(\d{1,2})\s*[-/S ]?\s*([A-Z]{3,})\s*[-/]?\s*((19|20)\d{2})\b",
+    # Fallback: any named-month date on full page within plausible birth year range
+    for mf in re.finditer(
+        r"(\d{1,2})\s*[-/. S]?\s*([A-Za-z]{3,})\s*[-/. ]?\s*([0-9A-Za-z]{2,4})\b",
         text, re.I,
-    )
-    if mf:
-        raw = f"{mf.group(1)}-{mf.group(2)}-{mf.group(3)}"
-        return _parse_date(raw)
+    ):
+        parsed = _try_parse_named_month(mf.group(1), mf.group(2), mf.group(3))
+        if parsed:
+            return parsed
+
     return None
 
 
@@ -385,36 +409,163 @@ def _extract_fn_from_declaration_text(text: str, upper: str) -> Optional[str]:
             except Exception:
                 pass
 
-    # Strategy 3: any dd/mm/yyyy or dd-mm-yyyy date on the page that looks like a birth year
-    # (avoid expedition or form dates — prefer years in 1950-2005 range)
-    for mf in re.finditer(r"\b(\d{2})[-/](\d{2})[-/](\d{2,4})\b", text):
-        d_str, m_str, y_str = mf.group(1), mf.group(2), mf.group(3)
-        y = int(y_str) if y_str.isdigit() else 0
+    # Strategy 3: any dd/mm/yy(yy) date with optional multi-char separators.
+    # Also applies _fix_ocr_digits to the year field so "6S"→"65" and "BS"→"85".
+    for mf in re.finditer(r"\b(\d{2})[-/ ]+(\d{2})[-/ ]+(\w{2,4})\b", text):
+        d_str, m_str, y_raw = mf.group(1), mf.group(2), mf.group(3)
+        y_str = _fix_ocr_digits(y_raw)
+        if not y_str.isdigit():
+            continue
+        y = int(y_str)
         if y < 100:
             y += 1900 if y > 30 else 2000
-        if 1940 <= y <= 2005:  # plausible birth year range
+        if 1940 <= y <= 2010:
             try:
-                from datetime import datetime
                 dt = datetime(y, int(m_str), int(d_str))
                 return dt.strftime("%Y-%m-%d")
             except ValueError:
                 continue
 
+    # Strategy 4: concatenated digits after FECHA NACIMIENTO keyword.
+    # Also searches for bare NACIMIENTO when FECHA is misread by OCR (e.g. → RECNA).
+    # Handles OCR that inserts noise digits into separators: "03/02/2000" → "0310212000"
+    # (slashes read as "1"; noise) or "03022000" (no separators).
+    for kw in ("FECHA NACIMIENTO", "FECHA DE NACIMIENTO", "FECHANACIMIENTO", "NACIMIENTO"):
+        pos = upper.find(kw)
+        if pos < 0:
+            continue
+        # For bare NACIMIENTO, skip "LUGAR DE NACIMIENTO" occurrences
+        if kw == "NACIMIENTO":
+            ctx = upper[max(0, pos - 12):pos]
+            if "LUGAR" in ctx or "FECHA" in ctx:
+                continue
+
+        after_kw = text[pos + len(kw): pos + len(kw) + 80]
+        digits = re.sub(r"\D", "", after_kw)
+
+        # Find the year first, then extract DDMM from the 4 digits before it
+        ym = re.search(r"(19|20)(\d{2})", digits)
+        if ym:
+            year = int(ym.group(0))
+            before_year = digits[:ym.start()]
+            # Strip any extra leading noise digits so we get exactly DDMM
+            if len(before_year) >= 4:
+                ddmm = before_year[-4:]  # last 4 digits before year = DDMM
+                d_v, m_v = int(ddmm[:2]), int(ddmm[2:4])
+                if 1 <= d_v <= 31 and 1 <= m_v <= 12 and 1940 <= year <= 2010:
+                    try:
+                        return datetime(year, m_v, d_v).strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+
+    return None
+
+
+def _adaptive_threshold(img: "Image.Image") -> "Image.Image":
+    """Simple adaptive binarization using local mean (no scipy needed)."""
+    import numpy as np
+    from PIL import ImageFilter
+    arr = np.array(img).astype(float)
+    blurred = np.array(img.filter(ImageFilter.BoxBlur(radius=20))).astype(float)
+    binary = ((arr > blurred * 0.88) * 255).astype(np.uint8)
+    return Image.fromarray(binary)
+
+
+def _ocr_cedula_hires(page) -> Optional[str]:
+    """
+    High-resolution OCR pass for cedula back pages, focused on the FECHA NACIMIENTO row.
+    Intentionally FAST: only 3 crop zones × 1 config = 3 OCR calls max.
+    Returns named-month dates only (never numeric fallback) to avoid picking up
+    expedition dates that appear on the same page.
+    """
+    from PIL import ImageEnhance, ImageFilter
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(3.5, 3.5), alpha=False)
+        full = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+    except Exception:
+        return None
+
+    w, h = full.size
+    # Three targeted crop zones covering where NACIMIENTO row appears on Colombian cedulas
+    for top_p, bot_p in [(0.30, 0.58), (0.38, 0.63), (0.22, 0.52)]:
+        try:
+            crop = full.crop((0, int(h * top_p), w, int(h * bot_p)))
+            sharpened = crop.filter(ImageFilter.SHARPEN).filter(ImageFilter.SHARPEN)
+            try:
+                img = _adaptive_threshold(sharpened)
+            except Exception:
+                img = ImageEnhance.Contrast(sharpened).enhance(2.2)
+            txt = pytesseract.image_to_string(
+                img, lang="spa+eng", config="--psm 6 --oem 1 --dpi 350", timeout=18
+            )
+            t = _normalize_spaces(txt)
+            result = _extract_fn_from_cedula_text(t, t.upper())
+            if result:
+                return result
+        except Exception:
+            continue
     return None
 
 
 def _ocr_retry_fn(page, extractor_fn, scale: float = 2.0, contrast: float = 1.8) -> Optional[str]:
-    """Re-OCR a page at higher scale+contrast and apply extractor_fn. Returns None on failure."""
+    """
+    Re-OCR a page at higher scale+contrast, try multiple PSM/OEM combos.
+    For cedula pages also tries cropping to the bottom half (cedula back)
+    with adaptive thresholding.
+    Returns the first non-None result from extractor_fn, or None.
+    """
+    from PIL import ImageEnhance
     try:
-        from PIL import ImageEnhance
         pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
-        img = ImageEnhance.Contrast(img).enhance(contrast)
-        txt = pytesseract.image_to_string(img, lang="spa+eng", config="--psm 6", timeout=30)
-        t = _normalize_spaces(txt)
-        return extractor_fn(t, t.upper())
+        img_base = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+        img_enh = ImageEnhance.Contrast(img_base).enhance(contrast)
+        img_bin = _adaptive_threshold(img_base)
     except Exception:
         return None
+
+    # Standard attempts: full page
+    configs = [
+        ("--psm 6  --oem 1 --dpi 300", img_enh),
+        ("--psm 11 --oem 1 --dpi 300", img_enh),
+        ("--psm 6  --oem 1 --dpi 300", img_bin),
+        ("--psm 11 --oem 1 --dpi 300", img_bin),
+        ("--psm 6  --oem 3 --dpi 300", img_enh),
+    ]
+    for cfg, img in configs:
+        try:
+            txt = pytesseract.image_to_string(img, lang="spa+eng", config=cfg, timeout=25)
+            t = _normalize_spaces(txt)
+            result = extractor_fn(t, t.upper())
+            if result:
+                return result
+        except Exception:
+            continue
+
+    # Cedula-specific: try different vertical crop zones at 3x scale
+    # (cedula back with birth date is typically in 40-60% vertical range)
+    try:
+        pix3 = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0), alpha=False)
+        full = Image.open(io.BytesIO(pix3.tobytes("png"))).convert("L")
+        w, h = full.size
+        for top_p, bot_p in [(0.40, 0.60), (0.43, 0.58), (0.45, 0.62)]:
+            crop = full.crop((0, int(h * top_p), w, int(h * bot_p)))
+            crop_bin = _adaptive_threshold(crop)
+            for cfg, img in [
+                ("--psm 6 --oem 1 --dpi 300", crop_bin),
+                ("--psm 11 --oem 1 --dpi 300", crop_bin),
+            ]:
+                try:
+                    txt = pytesseract.image_to_string(img, lang="spa+eng", config=cfg, timeout=20)
+                    t = _normalize_spaces(txt)
+                    result = extractor_fn(t, t.upper())
+                    if result:
+                        return result
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return None
 
 
 def _ocr_text(page, scale: float = 1.8) -> str:
@@ -483,21 +634,26 @@ def extract_documents_ordered(pdf_path: str | Path) -> List[Dict[str, Any]]:
                 prev_page = doc[i - 1]
                 prev_text = page_texts[i - 1]
                 prev_upper = page_uppers[i - 1]
-                cedula_fn = _extract_fn_from_cedula_text(prev_text, prev_upper)
-                if not cedula_fn:
-                    # Retry at 2.5x + contrast (typeset dates need more resolution)
-                    cedula_fn = _ocr_retry_fn(prev_page, _extract_fn_from_cedula_text,
-                                              scale=2.5, contrast=2.0)
+                # Quick first pass (already OCR'd at 1.8x)
+                cedula_fn_initial = _extract_fn_from_cedula_text(prev_text, prev_upper)
+                # Always run hires crop — it uses sharpening+binarization and often
+                # corrects visual confusions (7→4, 8→6) that the 1.8x scan misses.
+                cedula_fn_hires = _ocr_cedula_hires(prev_page)
+                # Prefer hires result; fall back to initial only if hires found nothing
+                cedula_fn = cedula_fn_hires or cedula_fn_initial
 
             # ── Start new person ──
             current = {"fn": cedula_fn, "extraprima": False}
             in_person = True
 
             # ── Try declaration page itself ──
+            decl_fn_initial = _extract_fn_from_declaration_text(text, upper)
+            # Always retry at 3.0x — higher scale reads ambiguous digits better
+            # (e.g. "14" → "17", "6S" → more readable). Prefer hires result.
+            decl_fn_hires = _ocr_retry_fn(doc[i], _extract_fn_from_declaration_text,
+                                           scale=3.0, contrast=1.8)
             if not current["fn"]:
-                current["fn"] = _extract_fn_from_declaration_text(text, upper)
-            if not current["fn"]:
-                current["fn"] = _ocr_retry_fn(doc[i], _extract_fn_from_declaration_text)
+                current["fn"] = decl_fn_hires or decl_fn_initial
 
             current["extraprima"] = _detect_medical_yes_from_text(upper)
 

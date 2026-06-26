@@ -395,9 +395,7 @@ async function processFiles(){
   const docsFile = document.getElementById("pdf_docs").files[0];
   if(!projFile){ alert("Selecciona al menos el PDF de Proyecciones"); return; }
 
-  rows.length = 0;
-  renderRows();
-  document.getElementById("empty_row").style.display = "none";
+  // Keep existing rows — new results are appended below
   setProcessing(true);
   showLoadingPlaceholder();
   setPhase(1, 10, "Enviando archivos al servidor...");
