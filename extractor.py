@@ -519,51 +519,24 @@ def _ocr_retry_fn(page, extractor_fn, scale: float = 2.0, contrast: float = 1.8)
         pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
         img_base = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
         img_enh = ImageEnhance.Contrast(img_base).enhance(contrast)
-        img_bin = _adaptive_threshold(img_base)
     except Exception:
         return None
 
-    # Standard attempts: full page
+    # Three targeted configs — returns on first hit, avoids unnecessary OCR calls
     configs = [
-        ("--psm 6  --oem 1 --dpi 300", img_enh),
+        ("--psm 6 --oem 1 --dpi 300", img_enh),
         ("--psm 11 --oem 1 --dpi 300", img_enh),
-        ("--psm 6  --oem 1 --dpi 300", img_bin),
-        ("--psm 11 --oem 1 --dpi 300", img_bin),
-        ("--psm 6  --oem 3 --dpi 300", img_enh),
+        ("--psm 6 --oem 3 --dpi 300", img_enh),
     ]
     for cfg, img in configs:
         try:
-            txt = pytesseract.image_to_string(img, lang="spa+eng", config=cfg, timeout=25)
+            txt = pytesseract.image_to_string(img, lang="spa+eng", config=cfg, timeout=20)
             t = _normalize_spaces(txt)
             result = extractor_fn(t, t.upper())
             if result:
                 return result
         except Exception:
             continue
-
-    # Cedula-specific: try different vertical crop zones at 3x scale
-    # (cedula back with birth date is typically in 40-60% vertical range)
-    try:
-        pix3 = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0), alpha=False)
-        full = Image.open(io.BytesIO(pix3.tobytes("png"))).convert("L")
-        w, h = full.size
-        for top_p, bot_p in [(0.40, 0.60), (0.43, 0.58), (0.45, 0.62)]:
-            crop = full.crop((0, int(h * top_p), w, int(h * bot_p)))
-            crop_bin = _adaptive_threshold(crop)
-            for cfg, img in [
-                ("--psm 6 --oem 1 --dpi 300", crop_bin),
-                ("--psm 11 --oem 1 --dpi 300", crop_bin),
-            ]:
-                try:
-                    txt = pytesseract.image_to_string(img, lang="spa+eng", config=cfg, timeout=20)
-                    t = _normalize_spaces(txt)
-                    result = extractor_fn(t, t.upper())
-                    if result:
-                        return result
-                except Exception:
-                    continue
-    except Exception:
-        pass
 
     return None
 
@@ -601,17 +574,25 @@ def extract_documents_ordered(pdf_path: str | Path) -> List[Dict[str, Any]]:
     doc = fitz.open(str(pdf_path))
     n = len(doc)
 
-    # ── Pass 1: classify all pages ──────────────────────────────────────────
-    page_texts: List[str] = []
-    page_uppers: List[str] = []
-    page_is_decl: List[bool] = []
+    # ── Pass 1: classify all pages in parallel ───────────────────────────────
+    # Each Tesseract call is a subprocess → GIL is released → true parallelism.
+    from concurrent.futures import ThreadPoolExecutor
 
-    for page in doc:
-        text = _ocr_text(page, scale=1.8)
+    def _classify_page(idx: int):
+        text = _ocr_text(doc[idx], scale=1.8)
         upper = text.upper()
-        page_texts.append(text)
-        page_uppers.append(upper)
-        page_is_decl.append("ASEGURABILIDAD" in upper or "DECLARACION" in upper)
+        is_decl = "ASEGURABILIDAD" in upper or "DECLARACION" in upper
+        return idx, text, upper, is_decl
+
+    page_texts: List[str] = [""] * n
+    page_uppers: List[str] = [""] * n
+    page_is_decl: List[bool] = [False] * n
+
+    with ThreadPoolExecutor(max_workers=min(4, n)) as pool:
+        for idx, text, upper, is_decl in pool.map(_classify_page, range(n)):
+            page_texts[idx] = text
+            page_uppers[idx] = upper
+            page_is_decl[idx] = is_decl
 
     # ── Pass 2: extract per person ──────────────────────────────────────────
     results: List[Dict] = []
@@ -634,13 +615,14 @@ def extract_documents_ordered(pdf_path: str | Path) -> List[Dict[str, Any]]:
                 prev_page = doc[i - 1]
                 prev_text = page_texts[i - 1]
                 prev_upper = page_uppers[i - 1]
-                # Quick first pass (already OCR'd at 1.8x)
+                # Fast pass on text already OCR'd at 1.8x
                 cedula_fn_initial = _extract_fn_from_cedula_text(prev_text, prev_upper)
-                # Always run hires crop — it uses sharpening+binarization and often
-                # corrects visual confusions (7→4, 8→6) that the 1.8x scan misses.
-                cedula_fn_hires = _ocr_cedula_hires(prev_page)
-                # Prefer hires result; fall back to initial only if hires found nothing
-                cedula_fn = cedula_fn_hires or cedula_fn_initial
+                if cedula_fn_initial:
+                    # Initial OCR found a date — trust it (saves 3 extra OCR calls)
+                    cedula_fn = cedula_fn_initial
+                else:
+                    # Nothing found → retry at 3.5x with sharpening/binarization
+                    cedula_fn = _ocr_cedula_hires(prev_page)
 
             # ── Start new person ──
             current = {"fn": cedula_fn, "extraprima": False}
